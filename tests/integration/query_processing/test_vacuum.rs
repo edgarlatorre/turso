@@ -2116,3 +2116,187 @@ fn test_vacuum_into_with_multiple_strict_tables(tmp_db: TempDatabase) -> anyhow:
 
     Ok(())
 }
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_creates_encrypted_destination(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world'), (3, 'test')")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("encrypted_dest.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+    let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let cipher = "aegis256";
+
+    conn.execute(format!(
+        "VACUUM INTO 'file:{dest_path_str}?cipher={cipher}&hexkey={hexkey}'"
+    ))?;
+
+    {
+        let result = turso_core::Connection::from_uri(
+            &format!("file:{dest_path_str}"),
+            turso_core::DatabaseOpts::new(),
+        );
+        assert!(
+            result.is_err(),
+            "Destination should require encryption key to open"
+        );
+    }
+
+    {
+        let dest_uri = format!("file:{dest_path_str}?cipher={cipher}&hexkey={hexkey}");
+        let (_io, dest_conn) = turso_core::Connection::from_uri(
+            &dest_uri,
+            turso_core::DatabaseOpts::new().with_encryption(true),
+        )?;
+
+        let dest_conn_arc = Arc::new(dest_conn.clone());
+        assert_eq!(run_integrity_check(&dest_conn_arc), "ok");
+
+        let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, data FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                (1, "hello".to_string()),
+                (2, "world".to_string()),
+                (3, "test".to_string())
+            ]
+        );
+    }
+
+    // Note: dbhash check skipped for encrypted databases because
+    // TempDatabase::new_with_existent cannot open encrypted databases without key.
+    // Data integrity is already verified by row comparison above.
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_encrypted_to_encrypted_different_cipher(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let hexkey_source = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"; // 64 chars for aegis256
+    let hexkey_dest = "aabbccdd445566778899aabbccddeeff"; // 32 chars for aegis128l (16 bytes)
+
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute(format!("PRAGMA hexkey = '{hexkey_source}'"))?;
+        conn.execute("PRAGMA cipher = 'aegis256'")?;
+
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)")?;
+        conn.execute("INSERT INTO t VALUES (1, 'encrypted'), (2, 'source')")?;
+    }
+
+    // Note: dbhash cannot be computed for encrypted databases without the key
+    // We verify data integrity through row comparison instead
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("reencrypted_dest.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute(format!("PRAGMA hexkey = '{hexkey_source}'"))?;
+        conn.execute("PRAGMA cipher = 'aegis256'")?;
+
+        conn.execute(format!(
+            "VACUUM INTO 'file:{dest_path_str}?cipher=aegis128l&hexkey={hexkey_dest}'"
+        ))?;
+    }
+
+    {
+        let result = turso_core::Connection::from_uri(
+            &format!("file:{dest_path_str}?cipher=aegis256&hexkey={hexkey_source}"),
+            turso_core::DatabaseOpts::new(),
+        );
+        assert!(
+            result.is_err(),
+            "Destination should NOT open with source cipher"
+        );
+
+        let dest_uri = format!("file:{dest_path_str}?cipher=aegis128l&hexkey={hexkey_dest}");
+        let (_io, dest_conn) = turso_core::Connection::from_uri(
+            &dest_uri,
+            turso_core::DatabaseOpts::new().with_encryption(true),
+        )?;
+
+        let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, data FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![(1, "encrypted".to_string()), (2, "source".to_string())]
+        );
+    }
+
+    {
+        let source_uri = format!(
+            "file:{}?cipher=aegis256&hexkey={}",
+            tmp_db.path.to_str().unwrap(),
+            hexkey_source
+        );
+        let (_io, source_conn) = turso_core::Connection::from_uri(
+            &source_uri,
+            turso_core::DatabaseOpts::new().with_encryption(true),
+        )?;
+
+        let rows: Vec<(i64, String)> = source_conn.exec_rows("SELECT id, data FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![(1, "encrypted".to_string()), (2, "source".to_string())]
+        );
+    }
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_encryption_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")?;
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let dest_dir = TempDir::new()?;
+
+    {
+        let dest_path = dest_dir.path().join("missing_hexkey.db");
+        let result = conn.execute(format!(
+            "VACUUM INTO 'file:{}?cipher=aegis256'",
+            dest_path.to_str().unwrap()
+        ));
+        assert!(
+            result.is_err(),
+            "VACUUM INTO should fail when cipher is provided without hexkey"
+        );
+    }
+
+    {
+        let dest_path = dest_dir.path().join("missing_cipher.db");
+        let result = conn.execute(format!(
+            "VACUUM INTO 'file:{}?hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327'",
+            dest_path.to_str().unwrap()
+        ));
+        assert!(
+            result.is_err(),
+            "VACUUM INTO should fail when hexkey is provided without cipher"
+        );
+    }
+
+    {
+        let dest_path = dest_dir.path().join("invalid_cipher.db");
+        let result = conn.execute(format!(
+            "VACUUM INTO 'file:{}?cipher=invalidcipher&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327'",
+            dest_path.to_str().unwrap()
+        ));
+        assert!(
+            result.is_err(),
+            "VACUUM INTO should fail with invalid cipher name"
+        );
+    }
+
+    Ok(())
+}

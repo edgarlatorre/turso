@@ -63,8 +63,8 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{
-    get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor, NonNan, QueryMode,
+    get_cursor, CaptureDataChangesInfo, CheckpointMode, CipherMode, Completion, Connection,
+    DatabaseStorage, EncryptionKey, IOExt, MvCursor, NonNan, QueryMode,
 };
 use crate::{CdcVersion, Statement};
 use branches::{mark_unlikely, unlikely};
@@ -13657,9 +13657,31 @@ fn op_vacuum_into_inner(
                 // This ensures VACUUM INTO actually writes to disk.
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
                 let source_db = &program.connection.db;
+
+                let opts = crate::util::OpenOptions::parse(dest_path)?;
+
+                let encryption_opts = match (&opts.cipher, &opts.hexkey) {
+                    (Some(cipher), Some(hexkey)) => Some(crate::EncryptionOpts {
+                        cipher: cipher.clone(),
+                        hexkey: hexkey.clone(),
+                    }),
+                    (Some(_), None) => {
+                        return Err(LimboError::InvalidArgument(
+                            "hexkey is required when cipher is provided".into(),
+                        ))
+                    }
+                    (None, Some(_)) => {
+                        return Err(LimboError::InvalidArgument(
+                            "cipher is required when hexkey is provided".into(),
+                        ))
+                    }
+                    (None, None) => None,
+                };
+
                 let dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
-                    .with_index_method(source_db.experimental_index_method_enabled());
+                    .with_index_method(source_db.experimental_index_method_enabled())
+                    .with_encryption(encryption_opts.is_some());
 
                 program.connection.execute("BEGIN")?;
                 // lets set the same meta values as source db
@@ -13676,28 +13698,47 @@ fn op_vacuum_into_inner(
                     "page_size",
                 )?;
 
-                let reserved_space = {
+                // Parse cipher mode if encrypting, and calculate appropriate reserved space
+                let dest_cipher_mode = encryption_opts
+                    .as_ref()
+                    .map(|enc_opts| CipherMode::try_from(enc_opts.cipher.as_str()))
+                    .transpose()?;
+
+                // Calculate reserved space:
+                // - For encrypted destinations: use cipher metadata size (encryption header space)
+                // - For non-encrypted destinations: copy from source
+                let reserved_space = if let Some(cipher_mode) = dest_cipher_mode {
+                    cipher_mode.metadata_size() as u8
+                } else {
                     let pager = program.connection.pager.load();
-                    let reserved_space: u8 = match program.connection.get_reserved_bytes() {
+                    match program.connection.get_reserved_bytes() {
                         Some(val) => val,
                         None => io.block(|| pager.with_header(|header| header.reserved_space))?,
-                    };
-                    reserved_space
+                    }
                 };
 
                 let dest_db = crate::Database::open_file_with_flags(
                     io,
-                    dest_path,
+                    &opts.path, // Use parsed path (without query params)
                     OpenFlags::Create,
                     dest_opts,
-                    None,
+                    encryption_opts.clone(),
                 )?;
+
                 let dest_conn = dest_db.connect()?;
-                dest_conn.reset_page_size(page_size)?;
-                // set reserved_space on destination to match source
-                // this is important for databases using encryption or checksums
-                // must be set before page 1 is allocated (before any schema operations)
+
+                // Set up encryption on destination BEFORE any page operations
+                if let Some(ref enc_opts) = encryption_opts {
+                    let cipher_mode = CipherMode::try_from(enc_opts.cipher.as_str())?;
+                    dest_conn.set_encryption_cipher(cipher_mode)?;
+                    let key = EncryptionKey::from_hex_string(&enc_opts.hexkey)?;
+                    dest_conn.set_encryption_key(key)?;
+                }
+
+                // set reserved_space on destination BEFORE reset_page_size
+                // this is critical for encryption - the cipher needs reserved bytes for metadata
                 dest_conn.set_reserved_bytes(reserved_space)?;
+                dest_conn.reset_page_size(page_size)?;
 
                 // Enable MVCC on destination if source has it enabled
                 // Must be done before any schema operations to ensure the log file is created
