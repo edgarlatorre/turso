@@ -13717,21 +13717,22 @@ fn op_vacuum_into_inner(
                     }
                 };
 
+                let dest_hexkey = encryption_opts.as_ref().map(|e| e.hexkey.clone());
+
                 let dest_db = crate::Database::open_file_with_flags(
                     io,
-                    &opts.path, // Use parsed path (without query params)
+                    &opts.path,
                     OpenFlags::Create,
                     dest_opts,
-                    encryption_opts.clone(),
+                    encryption_opts,
                 )?;
 
                 let dest_conn = dest_db.connect()?;
 
                 // Set up encryption on destination BEFORE any page operations
-                if let Some(ref enc_opts) = encryption_opts {
-                    let cipher_mode = CipherMode::try_from(enc_opts.cipher.as_str())?;
+                if let Some(cipher_mode) = dest_cipher_mode {
                     dest_conn.set_encryption_cipher(cipher_mode)?;
-                    let key = EncryptionKey::from_hex_string(&enc_opts.hexkey)?;
+                    let key = EncryptionKey::from_hex_string(&dest_hexkey.unwrap())?;
                     dest_conn.set_encryption_key(key)?;
                 }
 
