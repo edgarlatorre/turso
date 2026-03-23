@@ -13732,7 +13732,12 @@ fn op_vacuum_into_inner(
                 // Set up encryption on destination BEFORE any page operations
                 if let Some(cipher_mode) = dest_cipher_mode {
                     dest_conn.set_encryption_cipher(cipher_mode)?;
-                    let key = EncryptionKey::from_hex_string(&dest_hexkey.unwrap())?;
+                    let hexkey_str = dest_hexkey.as_ref().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "hexkey should be present when cipher_mode is set".into(),
+                        )
+                    })?;
+                    let key = EncryptionKey::from_hex_string(hexkey_str)?;
                     dest_conn.set_encryption_key(key)?;
                 }
 
