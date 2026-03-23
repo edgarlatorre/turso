@@ -2135,6 +2135,23 @@ fn test_vacuum_into_creates_encrypted_destination(tmp_db: TempDatabase) -> anyho
         "VACUUM INTO 'file:{dest_path_str}?cipher={cipher}&hexkey={hexkey}'"
     ))?;
 
+    // Verify source database is still accessible after VACUUM INTO
+    let source_integrity = run_integrity_check(&conn);
+    assert_eq!(
+        source_integrity, "ok",
+        "Source database should pass integrity check after VACUUM INTO"
+    );
+    let source_data: Vec<(i64, String)> = conn.exec_rows("SELECT id, data FROM t ORDER BY id");
+    assert_eq!(
+        source_data,
+        vec![
+            (1, "hello".to_string()),
+            (2, "world".to_string()),
+            (3, "test".to_string())
+        ],
+        "Source data should be unchanged after VACUUM INTO"
+    );
+
     {
         let result = turso_core::Connection::from_uri(
             &format!("file:{dest_path_str}"),
@@ -2206,6 +2223,19 @@ fn test_vacuum_into_encrypted_to_encrypted_different_cipher(
         conn.execute(format!(
             "VACUUM INTO 'file:{dest_path_str}?cipher=aegis128l&hexkey={hexkey_dest}'"
         ))?;
+
+        // Verify source database is still accessible after VACUUM INTO
+        let source_integrity = run_integrity_check(&conn);
+        assert_eq!(
+            source_integrity, "ok",
+            "Source database should pass integrity check after VACUUM INTO"
+        );
+        let source_data: Vec<(i64, String)> = conn.exec_rows("SELECT id, data FROM t ORDER BY id");
+        assert_eq!(
+            source_data,
+            vec![(1, "encrypted".to_string()), (2, "source".to_string())],
+            "Source data should be unchanged after VACUUM INTO"
+        );
     }
 
     {
